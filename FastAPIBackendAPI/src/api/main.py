@@ -108,10 +108,15 @@ class AnalyticsResponse(BaseModel):
 class AnomalyItem(BaseModel):
     """Anomaly item for listing."""
 
-    date: date = Field(..., description="Date of anomaly bucket.")
+    # NOTE: Pydantic v2 raises a PydanticUserError when a field name (`date`) clashes with
+    # a type annotation symbol in the same scope (`from datetime import date`).
+    # Keep the API field name as "date" via alias while using a safe Python attribute name.
+    date_: date = Field(..., alias="date", description="Date of anomaly bucket.")
     deviation_pct: float = Field(..., description="Deviation percent above baseline.")
     suggested_action: str = Field(..., description="Suggested operational follow-up.")
     severity: Literal["medium", "high"] = Field(..., description="Severity bucket derived from deviation.")
+
+    model_config = {"populate_by_name": True}
 
 
 class AnomaliesResponse(BaseModel):
