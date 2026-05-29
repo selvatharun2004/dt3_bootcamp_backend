@@ -1,1 +1,3 @@
-# dt3_bootcamp_backend
+# Project Repository
+
+This is the initial README file for the project.
