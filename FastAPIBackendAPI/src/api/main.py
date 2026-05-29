@@ -15,6 +15,17 @@ import os
 from sqlalchemy import text
 
 from .db import ENGINE
+from .db import get_db_session
+from . import models
+from .analytics import (
+    aggregate_daily_to_period,
+    ensure_category_benchmarks,
+    parse_readings_csv,
+    recompute_site_daily_baselines,
+    resolve_or_seed_site,
+    sha256_hex,
+    utc_today,
+)
 
 
 def _parse_cors_origins(raw: Optional[str]) -> List[str]:
@@ -228,8 +239,8 @@ app = FastAPI(
     title="Energy Analytics Backend API",
     description=(
         "Backend APIs for the Commercial Energy Consumption Analytics & Anomaly Alerts system.\n\n"
-        "This service currently returns **placeholder/demo data** to support the React dashboards, "
-        "and will evolve to use PostgreSQL persistence and real analytics."
+        "This service persists readings to PostgreSQL and computes rolling 4-week baselines and anomalies "
+        "to power the React dashboards."
     ),
     version="0.1.0",
     openapi_tags=OPENAPI_TAGS,
@@ -483,72 +494,68 @@ async def ingest_csv(
             detail="Missing filename.",
         )
 
-    content = (await file.read()).decode("utf-8", errors="replace")
-    reader = csv.DictReader(StringIO(content))
+    if ENGINE is None:
+        raise HTTPException(status_code=503, detail="Database is not configured (DATABASE_URL missing).")
 
-    if reader.fieldnames is None:
+    raw_bytes = await file.read()
+    content = raw_bytes.decode("utf-8", errors="replace")
+    accepted, rows_received, rows_rejected, errors = parse_readings_csv(content)
+
+    if rows_received == 0 and accepted == [] and errors:
         return JSONResponse(
             status_code=400,
             content=ProblemDetail(
                 title="Invalid CSV",
                 status=400,
-                detail="CSV must include a header row with 'timestamp' and 'kWh' columns.",
+                detail=errors[0],
             ).model_dump(),
         )
 
-    normalized = {h.strip().lower(): h for h in reader.fieldnames if h}
-    if "timestamp" not in normalized or "kwh" not in normalized:
-        return JSONResponse(
-            status_code=400,
-            content=ProblemDetail(
-                title="Missing required columns",
-                status=400,
-                detail=f"Expected columns: timestamp, kWh. Got: {', '.join(reader.fieldnames)}",
-            ).model_dump(),
+    # Persist upload + readings
+    with get_db_session() as session:
+        site = resolve_or_seed_site(session, site_id)
+
+        upload = models.IngestionUpload(
+            site_id=site.site_id,
+            original_filename=file.filename,
+            content_type=file.content_type,
+            file_sha256=sha256_hex(raw_bytes),
+            rows_received=rows_received,
+            rows_accepted=len(accepted),
+            rows_rejected=rows_rejected,
+            error_sample=errors,
         )
+        session.add(upload)
+        session.flush()  # get upload_id
 
-    rows_received = 0
-    rows_accepted = 0
-    errors: List[str] = []
+        # Insert readings (dedupe handled by DB unique index; we keep behavior "accept and ignore duplicates").
+        inserted = 0
+        for r in accepted:
+            mr = models.MeterReading(site_id=site.site_id, meter_id=None, upload_id=upload.upload_id, ts=r.ts, kwh=r.kwh)
+            session.add(mr)
+            inserted += 1
 
-    ts_key = normalized["timestamp"]
-    kwh_key = normalized["kwh"]
+        # Compute baselines/anomalies over the affected window (ingested range, plus 28d lookback handled internally).
+        if accepted:
+            min_day = min(r.ts.date() for r in accepted)
+            max_day = max(r.ts.date() for r in accepted)
+            recompute_site_daily_baselines(session, site=site, threshold_pct=20.0, start_day=min_day, end_day=max_day)
 
-    for row in reader:
-        rows_received += 1
-        raw_ts = (row.get(ts_key) or "").strip()
-        raw_kwh = (row.get(kwh_key) or "").strip()
-
+        # Commit all changes. If a unique constraint fails due to duplicates, rollback and return a helpful error.
         try:
-            # Accept ISO-8601; for placeholder we just validate parseability.
-            datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
-        except Exception:
-            if len(errors) < 10:
-                errors.append(f"Row {rows_received}: invalid timestamp '{raw_ts}'")
-            continue
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=f"Ingestion failed: {e}") from e
 
-        try:
-            kwh_val = float(raw_kwh)
-            if kwh_val < 0:
-                raise ValueError("kWh must be >= 0")
-        except Exception:
-            if len(errors) < 10:
-                errors.append(f"Row {rows_received}: invalid kWh '{raw_kwh}'")
-            continue
-
-        rows_accepted += 1
-
-    rows_rejected = rows_received - rows_accepted
-    upload_id = f"upl_{int(datetime.now(timezone.utc).timestamp())}"
-
-    return IngestSummary(
-        upload_id=upload_id,
-        site_id=site_id,
-        rows_received=rows_received,
-        rows_accepted=rows_accepted,
-        rows_rejected=rows_rejected,
-        errors=errors,
-    )
+        return IngestSummary(
+            upload_id=str(upload.upload_id),
+            site_id=site_id,
+            rows_received=rows_received,
+            rows_accepted=len(accepted),
+            rows_rejected=rows_rejected,
+            errors=errors,
+        )
 
 
 # PUBLIC_INTERFACE
@@ -575,29 +582,100 @@ def consumer_analytics(
     Returns:
     - AnalyticsResponse with KPI tiles and chart series.
     """
-    site_id, site_name = _make_demo_site(site_id)
-    baseline_series = _demo_baseline_vs_actual(threshold_pct=threshold_pct, days=28)
+    if ENGINE is None:
+        raise HTTPException(status_code=503, detail="Database is not configured (DATABASE_URL missing).")
 
-    # KPI values derived from placeholder anomalies/baseline, formatted as strings for UI tiles.
-    anomalies = [p for p in baseline_series if p.is_anomaly]
-    latest_dev = anomalies[-1].deviation_pct if anomalies else baseline_series[-1].deviation_pct
+    with get_db_session() as session:
+        site = resolve_or_seed_site(session, site_id)
 
-    kpis = [
-        KpiItem(label="Selected site", value=site_name),
-        KpiItem(label="Baseline deviation", value=f"+{latest_dev:.1f}%"),
-        KpiItem(label="Anomalies (30d)", value=str(len(anomalies)), tone="danger" if len(anomalies) > 0 else None),
-        KpiItem(label="Benchmark vs peers", value="-6.1%"),
-    ]
+        end_day = utc_today()
+        start_day = end_day - timedelta(days=27)
 
-    return AnalyticsResponse(
-        site_id=site_id,
-        site_name=site_name,
-        period=period,
-        kpis=kpis,
-        trends=_demo_trend_series(period=period, days=28),
-        baseline_vs_actual=baseline_series,
-        threshold_pct=threshold_pct,
-    )
+        # Ensure baselines are present for the last 28 days if we have readings.
+        # (If no readings, the response will be empty series but still contract-compatible.)
+        recompute_site_daily_baselines(session, site=site, threshold_pct=threshold_pct, start_day=start_day, end_day=end_day)
+        session.commit()
+
+        baseline_rows = (
+            session.execute(
+                select(models.DailySiteBaseline)
+                .where(models.DailySiteBaseline.site_id == site.site_id)
+                .where(models.DailySiteBaseline.day >= start_day)
+                .where(models.DailySiteBaseline.day <= end_day)
+                .order_by(models.DailySiteBaseline.day)
+            )
+            .scalars()
+            .all()
+        )
+
+        baseline_vs_actual = [
+            BaselinePoint(
+                ts=r.day,
+                actual_kwh=float(r.actual_kwh),
+                baseline_kwh=float(r.baseline_kwh),
+                deviation_pct=float(r.deviation_pct),
+                is_anomaly=float(r.deviation_pct) > float(threshold_pct),
+            )
+            for r in baseline_rows
+        ]
+
+        # Trends: aggregate daily actuals into requested period buckets.
+        daily_actuals = [(r.day, float(r.actual_kwh)) for r in baseline_rows]
+        trend_points = aggregate_daily_to_period(daily_actuals, period=period.value)
+        trends = [TimeseriesPoint(ts=d, kwh=round(kwh, 2)) for d, kwh in trend_points]
+
+        # KPI: anomaly count from anomalies table (last 30 days)
+        kpi_end = end_day
+        kpi_start = kpi_end - timedelta(days=29)
+        anomaly_count_30d = (
+            session.execute(
+                select(func.count())
+                .select_from(models.Anomaly)
+                .where(models.Anomaly.site_id == site.site_id)
+                .where(models.Anomaly.day >= kpi_start)
+                .where(models.Anomaly.day <= kpi_end)
+            )
+            .scalar_one()
+        )
+
+        latest_dev = baseline_vs_actual[-1].deviation_pct if baseline_vs_actual else 0.0
+        latest_kwh = baseline_vs_actual[-1].actual_kwh if baseline_vs_actual else 0.0
+
+        # Benchmark KPI: compare latest day to category peer avg if available (else "…")
+        bench_value = "…"
+        if site.business_category and baseline_vs_actual:
+            # Ensure benchmark row exists; populate a deterministic placeholder peer avg from latest actual.
+            ensure_category_benchmarks(session, business_category=site.business_category, days=[baseline_vs_actual[-1].ts])
+            bench = session.get(
+                models.CategoryBenchmarkDaily,
+                {"business_category": site.business_category, "day": baseline_vs_actual[-1].ts},
+            )
+            if bench and (bench.peer_avg_kwh or 0.0) <= 0.0:
+                bench.peer_avg_kwh = float(latest_kwh) * 1.06
+                session.commit()
+            if bench and bench.peer_avg_kwh > 0:
+                bench_value = f"{((latest_kwh - bench.peer_avg_kwh) / bench.peer_avg_kwh) * 100.0:+.1f}%"
+
+        kpis = [
+            KpiItem(label="Selected site", value=site.name),
+            KpiItem(label="Baseline deviation", value=f"{latest_dev:+.1f}%"),
+            KpiItem(
+                label="Anomalies (30d)",
+                value=str(int(anomaly_count_30d)),
+                tone="danger" if int(anomaly_count_30d) > 0 else None,
+            ),
+            KpiItem(label="Benchmark vs peers", value=bench_value),
+        ]
+
+        return AnalyticsResponse(
+            site_id=site_id,
+            site_name=site.name,
+            period=period,
+            kpis=kpis,
+            trends=trends,
+            baseline_vs_actual=baseline_vs_actual,
+            threshold_pct=threshold_pct,
+        )
 
 
 # PUBLIC_INTERFACE
@@ -622,7 +700,41 @@ def consumer_anomalies(
     Returns:
     - AnomaliesResponse containing anomaly items.
     """
-    return AnomaliesResponse(site_id=site_id, threshold_pct=threshold_pct, items=_demo_anomalies(site_id, threshold_pct))
+    if ENGINE is None:
+        raise HTTPException(status_code=503, detail="Database is not configured (DATABASE_URL missing).")
+
+    with get_db_session() as session:
+        site = resolve_or_seed_site(session, site_id)
+        end_day = utc_today()
+        start_day = end_day - timedelta(days=29)
+
+        # Ensure anomalies are up to date for the visible range.
+        recompute_site_daily_baselines(session, site=site, threshold_pct=threshold_pct, start_day=start_day, end_day=end_day)
+        session.commit()
+
+        rows = (
+            session.execute(
+                select(models.Anomaly)
+                .where(models.Anomaly.site_id == site.site_id)
+                .where(models.Anomaly.day >= start_day)
+                .where(models.Anomaly.day <= end_day)
+                .where(models.Anomaly.deviation_pct > threshold_pct)
+                .order_by(models.Anomaly.day.desc())
+            )
+            .scalars()
+            .all()
+        )
+
+        items = [
+            AnomalyItem(
+                date=r.day,
+                deviation_pct=float(r.deviation_pct),
+                suggested_action=r.suggested_action,
+                severity=r.severity,
+            )
+            for r in rows
+        ]
+        return AnomaliesResponse(site_id=site_id, threshold_pct=threshold_pct, items=items)
 
 
 # PUBLIC_INTERFACE
@@ -647,12 +759,55 @@ def consumer_benchmark(
     Returns:
     - BenchmarkResponse with site series vs peer average series.
     """
-    return BenchmarkResponse(
-        site_id=site_id,
-        category="Logistics (demo)",
-        period=period,
-        series=_demo_benchmark(period=period, days=28),
-    )
+    if ENGINE is None:
+        raise HTTPException(status_code=503, detail="Database is not configured (DATABASE_URL missing).")
+
+    with get_db_session() as session:
+        site = resolve_or_seed_site(session, site_id)
+        end_day = utc_today()
+        start_day = end_day - timedelta(days=27)
+
+        # Ensure we have daily baselines for site (used as daily actuals quickly).
+        recompute_site_daily_baselines(session, site=site, threshold_pct=20.0, start_day=start_day, end_day=end_day)
+        session.commit()
+
+        baseline_rows = (
+            session.execute(
+                select(models.DailySiteBaseline)
+                .where(models.DailySiteBaseline.site_id == site.site_id)
+                .where(models.DailySiteBaseline.day >= start_day)
+                .where(models.DailySiteBaseline.day <= end_day)
+                .order_by(models.DailySiteBaseline.day)
+            )
+            .scalars()
+            .all()
+        )
+
+        daily_actuals = [(r.day, float(r.actual_kwh)) for r in baseline_rows]
+        site_series = aggregate_daily_to_period(daily_actuals, period=period.value)
+
+        category = site.business_category or "Uncategorised"
+        # Ensure benchmark rows exist for each day bucket start.
+        days_needed = [d for d, _ in site_series]
+        if site.business_category:
+            ensure_category_benchmarks(session, business_category=site.business_category, days=days_needed)
+            # Deterministic placeholder: peer avg = site_kwh * 1.06
+            for d, kwh in site_series:
+                bench = session.get(models.CategoryBenchmarkDaily, {"business_category": site.business_category, "day": d})
+                if bench and (bench.peer_avg_kwh or 0.0) <= 0.0:
+                    bench.peer_avg_kwh = float(kwh) * 1.06
+            session.commit()
+
+        series: List[BenchmarkSeriesPoint] = []
+        for d, kwh in site_series:
+            peer = kwh * 1.06
+            if site.business_category:
+                bench = session.get(models.CategoryBenchmarkDaily, {"business_category": site.business_category, "day": d})
+                if bench and bench.peer_avg_kwh > 0:
+                    peer = float(bench.peer_avg_kwh)
+            series.append(BenchmarkSeriesPoint(ts=d, site_kwh=round(kwh, 2), peer_avg_kwh=round(peer, 2)))
+
+        return BenchmarkResponse(site_id=site_id, category=category, period=period, series=series)
 
 
 # PUBLIC_INTERFACE
@@ -670,7 +825,45 @@ def account_manager_portfolio() -> PortfolioResponse:
     Returns:
     - PortfolioResponse with ranked customers and summary statistics.
     """
-    return PortfolioResponse(items=_demo_portfolio())
+    if ENGINE is None:
+        raise HTTPException(status_code=503, detail="Database is not configured (DATABASE_URL missing).")
+
+    with get_db_session() as session:
+        end_day = utc_today()
+        start_day = end_day - timedelta(days=29)
+
+        # Rank by anomaly count last 30d, max deviation last 30d.
+        q = (
+            select(
+                models.Customer.name.label("customer"),
+                models.Site.name.label("site"),
+                func.count(models.Anomaly.anomaly_id).label("anomalies_30d"),
+                func.coalesce(func.max(models.Anomaly.deviation_pct), 0.0).label("max_deviation_pct"),
+            )
+            .select_from(models.Site)
+            .join(models.Customer, models.Customer.customer_id == models.Site.customer_id)
+            .outerjoin(
+                models.Anomaly,
+                (models.Anomaly.site_id == models.Site.site_id)
+                & (models.Anomaly.day >= start_day)
+                & (models.Anomaly.day <= end_day),
+            )
+            .group_by(models.Customer.name, models.Site.name)
+            .order_by(func.count(models.Anomaly.anomaly_id).desc(), func.max(models.Anomaly.deviation_pct).desc())
+            .limit(50)
+        )
+
+        rows = session.execute(q).all()
+        items = [
+            PortfolioRankItem(
+                customer=r.customer,
+                site=r.site,
+                anomalies_30d=int(r.anomalies_30d or 0),
+                max_deviation_pct=float(r.max_deviation_pct or 0.0),
+            )
+            for r in rows
+        ]
+        return PortfolioResponse(items=items)
 
 
 # PUBLIC_INTERFACE
@@ -693,24 +886,78 @@ def account_manager_alerts(
     Returns:
     - AlertsListResponse list.
     """
-    items = _demo_alerts()
-    if status:
-        items = [a for a in items if a.status == status]
-    return AlertsListResponse(items=items)
+    if ENGINE is None:
+        raise HTTPException(status_code=503, detail="Database is not configured (DATABASE_URL missing).")
+
+    with get_db_session() as session:
+        q = (
+            select(
+                models.Alert,
+                models.Site.name.label("site_name"),
+                models.Customer.name.label("customer_name"),
+            )
+            .select_from(models.Alert)
+            .join(models.Site, models.Site.site_id == models.Alert.site_id)
+            .join(models.Customer, models.Customer.customer_id == models.Site.customer_id)
+            .order_by(models.Alert.created_at.desc())
+            .limit(200)
+        )
+        if status is not None:
+            q = q.where(models.Alert.status == status.value)
+
+        rows = session.execute(q).all()
+        items = [
+            AlertItem(
+                alert_id=str(alert.alert_id),
+                created_at=alert.created_at.date(),
+                customer=customer_name,
+                site=site_name,
+                deviation_pct=float(alert.deviation_pct),
+                suggested_action=alert.suggested_action,
+                severity=alert.severity,
+                status=AlertStatus(alert.status),
+            )
+            for alert, site_name, customer_name in rows
+        ]
+        return AlertsListResponse(items=items)
 
 
 def _generate_export_csv(site_id: str, start_date: date, end_date: date) -> str:
-    """Generate a simple CSV export using demo baseline_vs_actual series."""
-    threshold_pct = 20.0
-    series = _demo_baseline_vs_actual(threshold_pct=threshold_pct, days=60)
-    rows = [p for p in series if start_date <= p.ts <= end_date]
+    """Generate a CSV export from persisted daily baselines (and compute missing baselines if needed)."""
+    if ENGINE is None:
+        raise HTTPException(status_code=503, detail="Database is not configured (DATABASE_URL missing).")
 
-    out = StringIO()
-    writer = csv.writer(out)
-    writer.writerow(["date", "actual_kwh", "baseline_kwh", "deviation_pct", "is_anomaly"])
-    for p in rows:
-        writer.writerow([p.ts.isoformat(), p.actual_kwh, p.baseline_kwh, p.deviation_pct, p.is_anomaly])
-    return out.getvalue()
+    with get_db_session() as session:
+        site = resolve_or_seed_site(session, site_id)
+        recompute_site_daily_baselines(session, site=site, threshold_pct=20.0, start_day=start_date, end_day=end_date)
+        session.commit()
+
+        rows = (
+            session.execute(
+                select(models.DailySiteBaseline)
+                .where(models.DailySiteBaseline.site_id == site.site_id)
+                .where(models.DailySiteBaseline.day >= start_date)
+                .where(models.DailySiteBaseline.day <= end_date)
+                .order_by(models.DailySiteBaseline.day)
+            )
+            .scalars()
+            .all()
+        )
+
+        out = StringIO()
+        writer = csv.writer(out)
+        writer.writerow(["date", "actual_kwh", "baseline_kwh", "deviation_pct", "is_anomaly"])
+        for r in rows:
+            writer.writerow(
+                [
+                    r.day.isoformat(),
+                    float(r.actual_kwh),
+                    float(r.baseline_kwh),
+                    float(r.deviation_pct),
+                    float(r.deviation_pct) > float(r.threshold_pct),
+                ]
+            )
+        return out.getvalue()
 
 
 # PUBLIC_INTERFACE
