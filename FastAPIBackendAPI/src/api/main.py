@@ -12,6 +12,10 @@ from pydantic import BaseModel, Field
 import csv
 import os
 
+from sqlalchemy import text
+
+from .db import ENGINE
+
 
 def _parse_cors_origins(raw: Optional[str]) -> List[str]:
     """
@@ -414,6 +418,34 @@ def websocket_usage_help() -> PlainTextResponse:
 def health() -> Dict[str, str]:
     """Return service health status."""
     return {"status": "ok"}
+
+
+# PUBLIC_INTERFACE
+@app.get(
+    "/health/db",
+    tags=["health"],
+    summary="Database health check",
+    description=(
+        "Checks PostgreSQL connectivity using SQLAlchemy.\\n\\n"
+        "If DATABASE_URL is not configured, returns 503 to indicate DB is unavailable."
+    ),
+)
+def health_db() -> Dict[str, str]:
+    """
+    Check database connectivity.
+
+    Returns:
+    - {"status":"ok","db":"ok"} when DB connectivity is healthy
+    - 503 when DATABASE_URL is not configured or the DB cannot be reached
+    """
+    if ENGINE is None:
+        raise HTTPException(status_code=503, detail="Database is not configured (DATABASE_URL missing).")
+    try:
+        with ENGINE.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"status": "ok", "db": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database connectivity failed: {e}") from e
 
 
 # PUBLIC_INTERFACE

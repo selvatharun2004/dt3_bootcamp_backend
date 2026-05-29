@@ -25,11 +25,34 @@ uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000
 
 - `CORS_ORIGINS` (optional): comma-separated list of allowed web origins. Default: `http://localhost:5173`
 - `API_PREFIX` (optional): API base path prefix. Default: `/api/v1`
+- `DATABASE_URL` (optional for placeholder mode, **required for DB/migrations**): SQLAlchemy URL for PostgreSQL (e.g. `postgresql+psycopg://user:pass@host:5432/dbname`)
+- `SQLALCHEMY_ECHO` (optional): set `true` to log SQL statements
+- `SQLALCHEMY_POOL_PRE_PING` (optional): set `true` to enable pool pre-ping (default true)
+
+## Database migrations (Alembic)
+
+This service includes Alembic migration support aligned to the reference schema in:
+`dt3_bootcamp_database/PostgreSQLDatabase/scripts/001_init_schema.sql`.
+
+Typical workflow:
+
+```bash
+# Ensure DATABASE_URL is set (in .env or container environment)
+alembic upgrade head
+```
+
+To create new migrations after updating `src/api/models.py`:
+
+```bash
+alembic revision --autogenerate -m "describe change"
+alembic upgrade head
+```
 
 ## Implemented endpoints (v1)
 
 ### Health
 - `GET /health`
+- `GET /health/db` (DB connectivity check; returns 503 if DB is not configured/reachable)
 
 ### Ingestion
 - `POST /api/v1/ingest/csv` (multipart upload)
